@@ -5,6 +5,8 @@
     Converts FLAC tracks in a Rekordbox XML database to WAV, updating the XML in place.
 .PARAMETER DryRun
     Preview all actions without converting files or modifying the database.
+.PARAMETER Force
+    Reconvert files that already have a WAV alongside them.
 #>
 [CmdletBinding()]
 param(
@@ -16,6 +18,11 @@ if ($DryRun) { Write-Host "[DRY RUN] No files will be converted and the database
 
 # $IsWindows is undefined in Windows PowerShell 5.1 (only set in PowerShell Core 6+)
 $onWindows = ($null -eq $IsWindows) -or $IsWindows
+
+. (Join-Path $PSScriptRoot "lib/RekordboxXml.ps1")
+. (Join-Path $PSScriptRoot "lib/Playlists.ps1")
+. (Join-Path $PSScriptRoot "lib/InteractiveMenu.ps1")
+if ($onWindows) { . (Join-Path $PSScriptRoot "lib/WindowsCFA.ps1") }
 
 # ── Prompt for XML path ───────────────────────────────────────────────────────
 $defaultPath = if ($onWindows) {
@@ -39,33 +46,6 @@ if (-not $ffmpegCmd) {
 }
 $ffmpegPath = $ffmpegCmd.Source
 
-# ── Whitelist ffmpeg in Controlled Folder Access (Windows only) ───────────────
-$isAdmin       = $false
-$cfaEnabled    = $false
-$ffmpegAllowed = $false
-if ($onWindows -and -not $DryRun) {
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    try {
-        $cfaEnabled = (Get-MpPreference -ErrorAction Stop).EnableControlledFolderAccess -eq 1
-    }
-    catch {
-        # Defender cmdlets unavailable; assume CFA is not active
-    }
-
-    if ($cfaEnabled) {
-        if (-not $isAdmin) {
-            Write-Warning "Windows Controlled Folder Access is enabled but the script is not running as Administrator. Conversions may fail with 'Permission denied'. Re-run as Administrator to allow the script to whitelist ffmpeg automatically."
-        }
-        else {
-            $ffmpegAllowed = (Get-MpPreference).ControlledFolderAccessAllowedApplications -contains $ffmpegPath
-            if (-not $ffmpegAllowed) {
-                Add-MpPreference -ControlledFolderAccessAllowedApplications $ffmpegPath
-                Write-Host "ffmpeg whitelisted in Controlled Folder Access." -ForegroundColor Green
-            }
-        }
-    }
-}
-
 # ── Output folder (logs + backups) ───────────────────────────────────────────
 $outputDir = Join-Path ([System.IO.Path]::GetDirectoryName($xmlPath)) "rekordbox-converter"
 if (-not $DryRun -and -not (Test-Path $outputDir)) {
@@ -78,41 +58,43 @@ $runTimestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $backupPath = Join-Path $outputDir ([System.IO.Path]::GetFileNameWithoutExtension($xmlPath) + "_$runTimestamp.bak")
 if ($DryRun) {
     Write-Host "[DRY RUN] Would create backup: $backupPath" -ForegroundColor Cyan
-}
-else {
+} else {
     Copy-Item $xmlPath $backupPath
     Write-Host "Backup created: $backupPath" -ForegroundColor Green
+}
+
+# ── Whitelist ffmpeg in Controlled Folder Access (Windows only) ───────────────
+$cfaState = $null
+if ($onWindows -and -not $DryRun) {
+    $cfaState = Register-FfmpegCFA $ffmpegPath
 }
 
 # ── Load XML ──────────────────────────────────────────────────────────────────
 [xml]$db = Get-Content $xmlPath -Encoding UTF8
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-function Decode-RekordboxLocation([string]$location) {
-    # Location format: file://localhost/D:/path/to/file.flac (Windows)
-    #                  file://localhost/Users/name/Music/track.flac (macOS)
-    $path = $location -replace '^file://localhost/', ''
-    $path = [Uri]::UnescapeDataString($path)
-    if ($onWindows) { return $path.Replace('/', '\') }
-    return "/$path"  # restore leading slash stripped by the URI prefix
-}
+# ── Select target ─────────────────────────────────────────────────────────────
+$playlists   = Get-RekordboxPlaylists $db
+$menuOptions = @("Entire collection") + ($playlists | ForEach-Object { $_.DisplayName })
+$selection   = Show-Menu -Title "What would you like to convert?" -Options $menuOptions
 
-function Encode-RekordboxLocation([string]$filePath) {
-    # Normalise to forward slashes and strip leading slash on macOS before building URI
-    $forward = $filePath.Replace('\', '/').TrimStart('/')
-    # URL-encode each path segment (spaces → %20, etc.) but keep slashes and colons intact
-    $encoded = ($forward.Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
-    return "file://localhost/$encoded"
+$targetTrackIds = $null  # $null means entire collection
+if ($selection -gt 0) {
+    $targetTrackIds = $playlists[$selection - 1].TrackIds
+    Write-Host "  Target : $($playlists[$selection - 1].DisplayName)`n" -ForegroundColor White
+} else {
+    Write-Host "  Target : Entire collection`n" -ForegroundColor White
 }
 
 # ── Process tracks ────────────────────────────────────────────────────────────
-$tracks = $db.SelectNodes("//TRACK[@Location]")
-$converted = 0
-$skipped = 0
-$errors = [System.Collections.Generic.List[string]]::new()
+$tracks     = $db.SelectNodes("//TRACK[@Location]")
+$converted  = 0
+$skipped    = 0
+$errors     = [System.Collections.Generic.List[string]]::new()
 $logEntries = [System.Collections.Generic.List[hashtable]]::new()
 
 foreach ($track in $tracks) {
+    if ($null -ne $targetTrackIds -and $targetTrackIds -notcontains $track.GetAttribute("TrackID")) { continue }
+
     $location = $track.GetAttribute("Location")
     if ($location -notmatch '\.flac$') { continue }
 
@@ -121,8 +103,7 @@ foreach ($track in $tracks) {
 
     if ($DryRun) {
         Write-Host "[DRY RUN] Would convert: $srcPath  ->  $wavPath" -ForegroundColor Cyan
-    }
-    else {
+    } else {
         Write-Host "Converting: $srcPath" -ForegroundColor Gray
     }
 
@@ -139,22 +120,20 @@ foreach ($track in $tracks) {
 
     if ($DryRun) {
         if ((Test-Path $wavPath) -and -not $Force) { Write-Host "  WAV already exists, would skip conversion: $wavPath" -ForegroundColor Yellow }
-    }
-    else {
+    } else {
         if ((Test-Path $wavPath) -and -not $Force) {
             Write-Host "  WAV already exists, skipping conversion: $wavPath" -ForegroundColor Yellow
-        }
-        else {
-            # -y     overwrite without prompt (shouldn't happen given check above, safety net)
-            # -c:a   pcm_s16le  standard CD-quality WAV; change to pcm_s24le for 24-bit sources
+        } else {
             $wasReadOnly = (Get-Item $srcPath).IsReadOnly
             if ($wasReadOnly) { Set-ItemProperty $srcPath -Name IsReadOnly -Value $false }
 
-            $loglevel = if ($VerbosePreference -ne 'SilentlyContinue') { @() } else { @("-loglevel", "error") }
+            # -c:a pcm_s16le  standard 16-bit WAV; change to pcm_s24le for 24-bit sources
+            $loglevel   = if ($VerbosePreference -ne 'SilentlyContinue') { @() } else { @("-loglevel", "error") }
             $ffmpegArgs = $loglevel + @("-i", $srcPath, "-y", "-c:a", "pcm_s16le", "-map_metadata", "0", "-id3v2_version", "3", $wavPath)
             & $ffmpegPath @ffmpegArgs
 
             if ($wasReadOnly) { Set-ItemProperty $srcPath -Name IsReadOnly -Value $true }
+
             if ($LASTEXITCODE -ne 0) {
                 $msg = "ffmpeg failed for: $srcPath (exit $LASTEXITCODE)"
                 Write-Host "  ERROR: $msg" -ForegroundColor Red
@@ -167,53 +146,49 @@ foreach ($track in $tracks) {
 
         Write-Host "  -> $wavPath" -ForegroundColor Green
 
-        # Update XML attribute
         $originalLocation = $location
-        $originalKind = if ($track.HasAttribute("Kind")) { $track.GetAttribute("Kind") } else { $null }
-        $newLocation = Encode-RekordboxLocation $wavPath
+        $originalKind     = if ($track.HasAttribute("Kind")) { $track.GetAttribute("Kind") } else { $null }
+        $newLocation      = Encode-RekordboxLocation $wavPath
 
         $track.SetAttribute("Location", $newLocation)
         if ($track.HasAttribute("Kind")) { $track.SetAttribute("Kind", "WAV File") }
 
         $logEntries.Add(@{
-                timestamp        = (Get-Date -Format "o")
-                flacPath         = $srcPath
-                wavPath          = $wavPath
-                status           = "success"
-                originalLocation = $originalLocation
-                newLocation      = $newLocation
-                originalKind     = $originalKind
-            })
+            timestamp        = (Get-Date -Format "o")
+            flacPath         = $srcPath
+            wavPath          = $wavPath
+            status           = "success"
+            originalLocation = $originalLocation
+            newLocation      = $newLocation
+            originalKind     = $originalKind
+        })
     }
 
     $converted++
 }
 
-# ── Remove ffmpeg from Controlled Folder Access whitelist ────────────────────
-if (-not $DryRun -and $cfaEnabled -and $isAdmin -and -not $ffmpegAllowed) {
-    Remove-MpPreference -ControlledFolderAccessAllowedApplications $ffmpegPath
-    Write-Host "ffmpeg removed from Controlled Folder Access whitelist." -ForegroundColor Green
+# ── Remove ffmpeg from Controlled Folder Access whitelist ─────────────────────
+if ($onWindows -and -not $DryRun -and $cfaState) {
+    Unregister-FfmpegCFA $ffmpegPath $cfaState
 }
 
 # ── Save updated XML ──────────────────────────────────────────────────────────
 if ($DryRun) {
     Write-Host "`n[DRY RUN] Database would be updated: $xmlPath" -ForegroundColor Cyan
-}
-elseif ($converted -gt 0) {
-    $settings = [System.Xml.XmlWriterSettings]::new()
-    $settings.Indent = $true
+} elseif ($converted -gt 0) {
+    $settings          = [System.Xml.XmlWriterSettings]::new()
+    $settings.Indent   = $true
     $settings.Encoding = [System.Text.UTF8Encoding]::new($false)  # UTF-8 without BOM
 
     $writer = [System.Xml.XmlWriter]::Create($xmlPath, $settings)
     $db.Save($writer)
     $writer.Close()
     Write-Host "`nDatabase updated: $xmlPath" -ForegroundColor Green
-}
-else {
+} else {
     Write-Host "`nNo tracks were converted; database unchanged." -ForegroundColor Yellow
 }
 
-# ── Write convert log ────────────────────────────────────────────────────────
+# ── Write convert log ─────────────────────────────────────────────────────────
 $logPath = Join-Path $outputDir "convert-log_$runTimestamp.json"
 if (-not $DryRun -and $logEntries.Count -gt 0) {
     @{
